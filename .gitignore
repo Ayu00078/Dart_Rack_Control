@@ -1,0 +1,23 @@
+# Keil build outputs
+**/*.axf
+**/*.hex
+**/*.bin
+**/*.map
+**/*.o
+**/*.d
+**/*.crf
+**/*.lnp
+**/*.dep
+**/*.sct
+**/*.lst
+**/build_log.htm
+
+# Local Keil output directory
+MDK-ARM/Dart_Rack_Control_v1t/
+
+# User- and machine-specific IDE/debug files
+MDK-ARM/*.uvguix.*
+MDK-ARM/JLinkLog.txt
+MDK-ARM/JLinkSettings.ini
+MDK-ARM/.vscode/*.log
+MDK-ARM/.vscode/*.log.lock
