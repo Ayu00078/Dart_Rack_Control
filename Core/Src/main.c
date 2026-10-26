@@ -37,18 +37,11 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define RXBUFFERSIZE  256U
+#define RXBUFFERSIZE  4U
 
-/* UART command format:
- *   0\r\n              toggle periodic debug output
- *   1\r\n              red LED toggle
- *   2 <position>\r\n  3508 pull the slide to the trigger position
- *   3 <position>\r\n  lock the trigger, then return the 3508 to this position
- *   4\r\n              release the trigger and launch
- *   5 <position>\r\n  Yaw position
- *   6 <position>\r\n  M2006 position
- *   7\r\n              move M2006 to the mechanical stop and zero there
- */
+/* UART7 串口屏输入：一个二进制命令字节 + 0D 0A；00 初始化，10~13 选档，
+ * 01 装载，03 发射，20 切换 LED。未知码/超长帧丢弃；以下位标志是内部命令，
+ * 不是串口屏按键码，不能把 UART_CMD_FIRE(04) 当作屏幕发射码(03)。 */
 #define UART_CMD_LOAD              0x01U
 #define UART_CMD_DEBUG_TOGGLE      0x02U
 #define UART_CMD_FIRE              0x04U
@@ -58,7 +51,26 @@
 #define UART_CMD_ZERO_TRIGGER      0x40U
 #define UART_CMD_SET_RETURN        0x80U
 
-/* DART launcher motor configuration copied from the source project. */
+/* 两台 3508 同时寻零：速度目标使用反向安装修正后的速度坐标；负号为当前机械方向。
+ * LIMIT 是发送给电机的最大电流命令，GATE 是 CAN 返回的实际反馈电流门槛，
+ * 两者不是同一测量值。反馈电流绝对值过门槛且解码后的速度绝对值低于 SPEED_GATE，
+ * 经过 BLANK 消隐并连续 CONFIRM 毫秒，才分别记录各自零点；超时整组失败。 */
+#define BASE_HOME_VELOCITY         (-1000.0f)
+#define BASE_HOME_CURRENT_LIMIT    3200
+#define BASE_HOME_CURRENT_GATE     2500
+#define BASE_HOME_SPEED_GATE       50
+#define BASE_HOME_BLANK_MS         300U
+#define BASE_HOME_CONFIRM_MS       200U
+#define BASE_HOME_TIMEOUT_MS       10000U
+/* 01 装载从下达时计时 3 秒，不以到位作为切换条件；随后锁舵机 1 秒再回程。
+ * 回程位置是以各自 3508 寻零点为原点的编码器累计计数。 */
+#define LOAD_AUTO_LOCK_MS          3000U
+#define LOAD_RETURN_POSITION       5000L
+
+/* 原工程默认目标及边界：这里的 Yaw 未执行本次三电机寻零，目标仍为绝对累计计数。
+ * 3508 默认目标用于启动初值；下面的位置边界宏当前未应用于屏幕四档，
+ * 修改边界宏不会限制选档位置；屏幕四档另见 launcher_apply_commands。
+ * 编码器计数不是机械角度或毫米，修改前须确认传动比和允许行程。 */
 #define YAW_ANGLE_MIN              10000L
 #define YAW_ANGLE_MAX              110000L
 #define YAW_ANGLE_DEFAULT          40000L
@@ -67,6 +79,7 @@
 #define LAUNCHER_LOAD_DEFAULT      367878L
 #define LAUNCHER_HOME_DEFAULT      55000L
 
+/* 超过 500 ms 无 CAN 反馈视为离线；到位判据同时要求位置误差、速度和持续时间。 */
 #define MOTOR_FEEDBACK_TIMEOUT_MS  500U
 #define YAW_TARGET_TOLERANCE       1000L
 #define YAW_VELOCITY_TOLERANCE     120.0f
@@ -74,12 +87,14 @@
 #define TRIGGER_TARGET_TOLERANCE   10000L
 #define TRIGGER_VELOCITY_TOLERANCE 100.0f
 #define TARGET_VELOCITY_TOLERANCE  30.0f
+/* 装载期间的独立卡滞增流参数，不参与寻零；增流限时限次，可能加大机械负载。 */
 #define LOAD_STALL_ERROR_THRESHOLD 50000L
 #define LOAD_STALL_VELOCITY_THRESHOLD 100.0f
 #define LOAD_STALL_DETECT_MS       200U
 #define LOAD_STALL_BOOST_MS        500U
 #define LOAD_STALL_MAX_ATTEMPTS    3U
 #define LOAD_STALL_BOOST_CURRENT   16384
+/* 各阶段的稳定确认、运动超时及舵机等待均以 HAL 毫秒计数。 */
 #define POSITION_STABLE_TIME_MS    100U
 #define MOTION_TIMEOUT_MS          10000U
 #define YAW_MOTION_TIMEOUT_MS      10000U
@@ -90,7 +105,8 @@
 #define MOTOR_CONTROL_PERIOD_MS    1U
 #define DEBUG_PRINT_PERIOD_MS      100U
 
-/* Servo PWM: timer counter is 1 MHz, period is 10000 counts (100 Hz). */
+/* 舵机 PWM：计数器 1 MHz、周期 10000 计数(100 Hz)；LOCK/AVOID 为两路舵机角度。
+ * 角度换算为脉宽后分别写 TIM4/TIM5，修改时先核实机械止挡。 */
 #define SERVO_MIN_PULSE             500U
 #define SERVO_MAX_PULSE             2500U
 #define SERVO_MAX_ANGLE             180U
@@ -99,7 +115,9 @@
 #define SERVO_AVOID_0               95U
 #define SERVO_AVOID_1               35U
 
-/* M2006 homing values copied from the source project. */
+/* M2006 寻零：反馈速度在解码时反向，发送电流在控制步骤中再次取反。
+ * 与 3508 不同，此处判定的是速度 PID 的输出电流命令达到 GATE 并保持 CONFIRM，
+ * 未检查反馈电流或低速；更改阈值前必须现场确认是否真的抵达机械零点。 */
 #define TRIGGER_HOME_VELOCITY       (-5000.0f)
 #define TRIGGER_HOME_CURRENT_LIMIT  6000
 #define TRIGGER_HOME_CURRENT_GATE   2000
@@ -123,6 +141,9 @@ uint8_t RxBuffer[RXBUFFERSIZE];
 uint8_t aRxBuffer;
 volatile uint16_t Uart7_Rx_Cnt;
 volatile uint8_t g_command_flags;
+static volatile uint8_t g_screen_command;
+static volatile uint8_t g_screen_pending;
+static uint8_t g_uart7_discard_frame;
 volatile int32_t g_pending_yaw_target;
 volatile int32_t g_pending_load_target;
 volatile int32_t g_pending_return_target;
@@ -162,8 +183,11 @@ void SystemClock_Config(void);
 
 typedef struct
 {
+  /* CAN 原始角度 0~8191；angle_with_rounds 为跨圈累计计数，速度经简单滤波。
+   * last_update_ms 用于判断反馈是否仍新鲜，online 仅表示曾收到过反馈。 */
   int16_t angle;
   int16_t velocity;
+  int16_t feedback_current;
   int32_t angle_with_rounds;
   int16_t last_angle;
   float filtered_velocity;
@@ -174,6 +198,7 @@ typedef struct
 
 typedef struct
 {
+  /* 串级控制：位置环输出目标速度，速度环输出 CAN 电流命令。 */
   float kp;
   float ki;
   float kd;
@@ -187,6 +212,8 @@ typedef struct
 
 typedef enum
 {
+  /* 空闲→装载→锁紧→回程→待发射→延时释放→发射→空闲；FAULT 为异常状态。
+   * 故障状态仍允许发射是现有操作约定，不代表机械状态安全。 */
   LAUNCHER_IDLE = 0,
   LAUNCHER_LOADING,
   LAUNCHER_LOCKING,
@@ -209,11 +236,24 @@ static PID_t g_trigger_angle_pid;
 static PID_t g_trigger_velocity_pid;
 
 static int32_t g_yaw_target = YAW_ANGLE_DEFAULT;
+/* 3508 的目标位置共享数值，但各自用 g_base_zero_offset[i] 计算实际误差；
+ * M2006 用 g_trigger_zero_offset，Yaw 不减零点偏移。 */
 static int32_t g_load_target = LAUNCHER_LOAD_DEFAULT;
 static int32_t g_return_target = LAUNCHER_HOME_DEFAULT;
 static int32_t g_trigger_target;
 static uint8_t g_yaw_control_enabled;
 static uint8_t g_load_control_enabled;
+static uint8_t g_base_zero_set;
+static uint8_t g_base_homing;
+static uint8_t g_base_homed[2];
+static int32_t g_base_zero_offset[2];
+static uint32_t g_base_home_confirm_ms[2];
+static uint32_t g_base_home_start_ms;
+static uint8_t g_initializing;
+static uint8_t g_initialized;
+static uint8_t g_preset_selected;
+static int32_t g_selected_load_target;
+static uint8_t g_auto_load;
 static int16_t g_last_load_current[2];
 static uint32_t g_fire_start_ms;
 static uint32_t g_lock_start_ms;
@@ -246,7 +286,6 @@ static int16_t load_apply_stall_boost(uint8_t motor_index,
                                       uint32_t now);
 static void set_trigger_servo_angle(uint8_t servo_index, uint16_t angle);
 static void parse_uart_command(const uint8_t *frame, uint16_t length);
-static uint8_t is_ascii_space(uint8_t c);
 static void uart7_queue_response(const char *message);
 static void uart7_response_service(void);
 static void uart7_debug_service(void);
@@ -362,6 +401,7 @@ static float pid_update(PID_t *pid, float target, float current)
 static uint8_t motor_is_online(const RM_MotorFeedback_t *motor,
                                uint32_t now)
 {
+  /* online 只标记曾收到 CAN 帧，真正在线还要求反馈时间未超限。 */
   return (uint8_t)(motor->online &&
                    ((uint32_t)(now - motor->last_update_ms) <=
                     MOTOR_FEEDBACK_TIMEOUT_MS));
@@ -372,6 +412,7 @@ static uint8_t motor_at_target(const RM_MotorFeedback_t *motor,
                                int32_t tolerance,
                                int32_t position_offset)
 {
+  /* 目标以寻零点为原点：实际位置 = 多圈累计计数 - 当前电机的零点偏移。 */
   int32_t error = motor->angle_with_rounds - position_offset - target;
   if (error < 0)
   {
@@ -427,8 +468,11 @@ static int16_t load_apply_stall_boost(uint8_t motor_index,
                                       int16_t normal_current,
                                       uint32_t now)
 {
-  int64_t position_error = (int64_t)target -
-                            (int64_t)motor->angle_with_rounds;
+  /* 仅装载阶段调用：远离目标且低速时临时提高电流，按电机分别限时限次。
+   * 不应用于寻零；切换目标时 load_stall_reset 清除历史次数。 */
+  int64_t position_error = (int64_t)target +
+                             (int64_t)g_base_zero_offset[motor_index] -
+                             (int64_t)motor->angle_with_rounds;
   uint8_t stalled;
 
   if (position_error < 0)
@@ -492,6 +536,8 @@ static int16_t position_controller(RM_MotorFeedback_t *motor,
                                    int32_t position_offset,
                                    int16_t output_limit)
 {
+  /* 外环位置误差生成目标速度，内环速度误差生成电流命令。
+   * 两台 3508 的目标相同但零点偏移不同；修改速度上限看位置环 output_limit。 */
   float velocity_target;
   float output;
 
@@ -524,8 +570,12 @@ static void decode_rm_feedback(RM_MotorFeedback_t *motor,
 {
   int16_t raw_angle = (int16_t)(((uint16_t)data[0] << 8) | data[1]);
   int16_t raw_velocity = (int16_t)(((uint16_t)data[2] << 8) | data[3]);
+  motor->feedback_current =
+      (int16_t)(((uint16_t)data[4] << 8) | data[5]);
   uint32_t now = HAL_GetTick();
 
+  /* 0x201 M2006 与 0x203 第二台 3508 反装：角度/速度取反；
+   * 电流反馈保留 CAN 原始符号，3508 发送时再反转第二台的电流命令。 */
   if (reverse_angle)
   {
     raw_angle = (int16_t)(8191 - raw_angle);
@@ -542,6 +592,7 @@ static void decode_rm_feedback(RM_MotorFeedback_t *motor,
   }
   else
   {
+    /* 跨越单圈 8192 计数边界时累计整圈；目标值均以累计编码器计数表达。 */
     if ((raw_angle < 2048) && (motor->last_angle > 6144))
     {
       motor->angle_with_rounds += 8192;
@@ -586,13 +637,10 @@ static void set_trigger_servo_angle(uint8_t servo_index, uint16_t angle)
   }
 }
 
-static uint8_t is_ascii_space(uint8_t c)
-{
-  return (uint8_t)(c == (uint8_t)' ' || c == (uint8_t)'\t');
-}
-
 static void uart7_queue_response(const char *message)
 {
+  /* 主循环把 ASCII 状态响应放入环形队列；队列满时本条直接丢弃。
+   * 输入协议为二进制按钮，不表示输出响应也是二进制按钮码。 */
   uint8_t head = g_uart7_response_head;
   uint8_t next = (uint8_t)((head + 1U) % UART7_RESPONSE_QUEUE_LEN);
   uint16_t length = (uint16_t)strlen(message);
@@ -613,6 +661,7 @@ static void uart7_queue_response(const char *message)
 
 static void uart7_response_service(void)
 {
+  /* 串口发送忙时等待中断完成；优先发状态响应，队列空才输出调试信息。 */
   uint8_t tail;
   uint8_t length;
 
@@ -698,217 +747,53 @@ static void uart7_debug_service(void)
   }
 }
 
-static uint8_t parse_uint32_parameter(const uint8_t *frame,
-                                      uint16_t length,
-                                      uint16_t *index,
-                                      uint32_t maximum,
-                                      uint32_t *value)
-{
-  uint32_t digit;
-  uint8_t digit_found = 0U;
-  uint8_t separator_found = 0U;
-
-  while ((*index < length) && is_ascii_space(frame[*index]))
-  {
-    separator_found = 1U;
-    (*index)++;
-  }
-  if (!separator_found)
-  {
-    return 0U;
-  }
-  while ((*index < length) && (frame[*index] >= (uint8_t)'0') &&
-         (frame[*index] <= (uint8_t)'9'))
-  {
-    digit = (uint32_t)(frame[*index] - (uint8_t)'0');
-    if ((*value > (maximum / 10U)) ||
-        ((*value == (maximum / 10U)) && (digit > (maximum % 10U))))
-    {
-      return 0U;
-    }
-    *value = *value * 10U + digit;
-    digit_found = 1U;
-    (*index)++;
-  }
-  while ((*index < length) && is_ascii_space(frame[*index]))
-  {
-    (*index)++;
-  }
-  return (uint8_t)(digit_found && (*index == length));
-}
-
-static uint8_t parse_int32_parameter(const uint8_t *frame,
-                                     uint16_t length,
-                                     uint16_t *index,
-                                     int32_t *value)
-{
-  uint32_t magnitude = 0U;
-  uint32_t digit;
-  uint32_t maximum;
-  uint8_t negative = 0U;
-  uint8_t digit_found = 0U;
-  uint8_t separator_found = 0U;
-
-  while ((*index < length) && is_ascii_space(frame[*index]))
-  {
-    separator_found = 1U;
-    (*index)++;
-  }
-  if (!separator_found)
-  {
-    return 0U;
-  }
-
-  if ((*index < length) && (frame[*index] == (uint8_t)'-'))
-  {
-    negative = 1U;
-    (*index)++;
-  }
-  else if ((*index < length) && (frame[*index] == (uint8_t)'+'))
-  {
-    (*index)++;
-  }
-
-  maximum = negative ? 2147483648UL : 2147483647UL;
-  while ((*index < length) && (frame[*index] >= (uint8_t)'0') &&
-         (frame[*index] <= (uint8_t)'9'))
-  {
-    digit = (uint32_t)(frame[*index] - (uint8_t)'0');
-    if ((magnitude > (maximum / 10U)) ||
-        ((magnitude == (maximum / 10U)) &&
-         (digit > (maximum % 10U))))
-    {
-      return 0U;
-    }
-    magnitude = magnitude * 10U + digit;
-    digit_found = 1U;
-    (*index)++;
-  }
-  while ((*index < length) && is_ascii_space(frame[*index]))
-  {
-    (*index)++;
-  }
-  if (!digit_found || (*index != length))
-  {
-    return 0U;
-  }
-
-  if (negative)
-  {
-    if (magnitude == 2147483648UL)
-    {
-      *value = (-2147483647L - 1L);
-    }
-    else
-    {
-      *value = -(int32_t)magnitude;
-    }
-  }
-  else
-  {
-    *value = (int32_t)magnitude;
-  }
-  return 1U;
-}
-
-static uint8_t parse_command_without_parameter(const uint8_t *frame,
-                                               uint16_t length,
-                                               uint16_t index)
-{
-  while ((index < length) && is_ascii_space(frame[index]))
-  {
-    index++;
-  }
-  return (uint8_t)(index == length);
-}
-
 static void parse_uart_command(const uint8_t *frame, uint16_t length)
 {
-  uint16_t index = 0U;
-  uint32_t value = 0U;
-  int32_t signed_value;
-  uint8_t command;
+  /* 中断接收完整 0D 0A 帧后，仅交给主循环一个合法的单字节按钮事件；
+   * 上一个事件未消费时忽略新事件，不在中断里驱动电机。 */
+  if ((length == 1U) &&
+      ((frame[0] == 0x00U) || (frame[0] == 0x01U) ||
+       (frame[0] == 0x03U) || (frame[0] == 0x10U) ||
+       (frame[0] == 0x11U) || (frame[0] == 0x12U) ||
+       (frame[0] == 0x13U) || (frame[0] == 0x20U)) &&
+      !g_screen_pending)
+  {
+    g_screen_command = frame[0];
+    g_screen_pending = 1U;
+  }
+}
 
-  while ((index < length) && is_ascii_space(frame[index]))
-  {
-    index++;
-  }
-  if (index >= length)
-  {
-    return;
-  }
-
-  command = frame[index++];
-  if (command == (uint8_t)'0')
-  {
-    if (parse_command_without_parameter(frame, length, index))
-    {
-      g_command_flags |= UART_CMD_DEBUG_TOGGLE;
-    }
-  }
-  else if (command == (uint8_t)'1')
-  {
-    if (parse_command_without_parameter(frame, length, index))
-    {
-      g_command_flags |= UART_CMD_LED_TOGGLE;
-    }
-  }
-  else if (command == (uint8_t)'2')
-  {
-    if (parse_int32_parameter(frame, length, &index, &signed_value) &&
-        (signed_value >= LOAD_POSITION_MIN) &&
-        (signed_value <= LOAD_POSITION_MAX))
-    {
-      g_pending_load_target = signed_value;
-      g_command_flags |= UART_CMD_LOAD;
-    }
-  }
-  else if (command == (uint8_t)'3')
-  {
-    if (parse_int32_parameter(frame, length, &index, &signed_value) &&
-        (signed_value >= LOAD_POSITION_MIN) &&
-        (signed_value <= LOAD_POSITION_MAX))
-    {
-      g_pending_return_target = signed_value;
-      g_command_flags |= UART_CMD_SET_RETURN;
-    }
-  }
-  else if (command == (uint8_t)'4')
-  {
-    if (parse_command_without_parameter(frame, length, index))
-    {
-      g_command_flags |= UART_CMD_FIRE;
-    }
-  }
-  else if (command == (uint8_t)'5')
-  {
-    if (parse_uint32_parameter(frame, length, &index,
-                               (uint32_t)YAW_ANGLE_MAX, &value) &&
-        (value >= (uint32_t)YAW_ANGLE_MIN))
-    {
-      g_pending_yaw_target = (int32_t)value;
-      g_command_flags |= UART_CMD_SET_YAW;
-    }
-  }
-  else if (command == (uint8_t)'6')
-  {
-    if (parse_int32_parameter(frame, length, &index, &signed_value))
-    {
-      g_pending_trigger_target = signed_value;
-      g_command_flags |= UART_CMD_SET_TRIGGER;
-    }
-  }
-  else if (command == (uint8_t)'7')
-  {
-    if (parse_command_without_parameter(frame, length, index))
-    {
-      g_command_flags |= UART_CMD_ZERO_TRIGGER;
-    }
-  }
+static void abort_initialization(const char *reason)
+{
+  /* 任一寻零超时/失联：取消三电机寻零与位置就绪，清零 3508 电流命令；
+   * 后续仍由控制循环发送零电流，FAULT 允许重新尝试初始化。 */
+  g_initializing = 0U;
+  g_initialized = 0U;
+  g_base_homing = 0U;
+  g_base_zero_set = 0U;
+  g_trigger_homing_enabled = 0U;
+  g_trigger_zero_set = 0U;
+  g_trigger_position_ready = 0U;
+  g_trigger_control_enabled = 0U;
+  g_load_control_enabled = 0U;
+  g_preset_selected = 0U;
+  g_auto_load = 0U;
+  g_base_homed[0] = g_base_homed[1] = 0U;
+  g_load_command_waiting = 0U;
+  g_last_load_current[0] = 0;
+  g_last_load_current[1] = 0;
+  g_launcher_state = LAUNCHER_FAULT;
+  pid_reset(&g_trigger_velocity_pid);
+  pid_reset(&g_load_velocity_pid[0]);
+  pid_reset(&g_load_velocity_pid[1]);
+  uart7_queue_response(reason);
 }
 
 static void launcher_init(void)
 {
+  /* 调速位置：修改以下 pid_config 的位置环 output_limit 可限制目标速度，
+   * 速度环 output_limit/position_controller 的末参限制 CAN 电流命令。
+   * 寻零速度不由这些位置环参数直接决定，而由 HOME_VELOCITY 宏决定。 */
   /* The source values are a useful starting point, but are too aggressive
    * for this bare-metal position loop and make Yaw hunt around the target.
    * Reduce the velocity-loop integral/derivative and the outer-loop gain. */
@@ -943,6 +828,15 @@ static void launcher_init(void)
   g_trigger_target = 0;
   g_yaw_control_enabled = 0U;
   g_load_control_enabled = 0U;
+  g_base_zero_set = 0U;
+  g_base_homing = 0U;
+  g_initializing = 0U;
+  g_initialized = 0U;
+  g_preset_selected = 0U;
+  g_auto_load = 0U;
+  g_base_homed[0] = g_base_homed[1] = 0U;
+  g_screen_pending = 0U;
+  g_uart7_discard_frame = 0U;
   g_yaw_command_waiting = 0U;
   g_load_command_waiting = 0U;
   g_load_command_number = 0U;
@@ -984,7 +878,10 @@ static void launcher_init(void)
 
 static void launcher_apply_commands(void)
 {
+  /* 原子取走 UART 中断提交的按钮事件与内部命令标志，避免读到半更新的目标值。
+   * 屏幕不直接设置位置：在这里查表并检查初始化/到位/反馈就绪条件。 */
   uint8_t flags;
+  uint8_t screen = 0xFFU;
   int32_t yaw_target;
   int32_t load_target;
   int32_t return_target;
@@ -992,6 +889,11 @@ static void launcher_apply_commands(void)
   uint32_t now = HAL_GetTick();
 
   __disable_irq();
+  if (g_screen_pending)
+  {
+    screen = g_screen_command;
+    g_screen_pending = 0U;
+  }
   flags = g_command_flags;
   yaw_target = g_pending_yaw_target;
   load_target = g_pending_load_target;
@@ -999,6 +901,99 @@ static void launcher_apply_commands(void)
   trigger_target = g_pending_trigger_target;
   g_command_flags = 0U;
   __enable_irq();
+
+  if (screen == 0x20U)
+  {
+    flags |= UART_CMD_LED_TOGGLE;
+  }
+  else if (screen == 0x00U)
+  {
+    /* 仅空闲或故障且三台寻零电机反馈在线时可开始：两台 3508 与
+     * M2006 同一控制周期寻零；Yaw(0x208) 不属于此初始化过程。 */
+    if (g_initializing ||
+        ((g_launcher_state != LAUNCHER_IDLE) &&
+         (g_launcher_state != LAUNCHER_FAULT)) ||
+        !motor_is_online(&g_trigger_feedback, now) ||
+        !motor_is_online(&g_load_feedback[0], now) ||
+        !motor_is_online(&g_load_feedback[1], now))
+    {
+      uart7_queue_response("INIT NOT READY\r\n");
+    }
+    else
+    {
+      g_initialized = 0U;
+      g_initializing = 1U;
+      g_preset_selected = 0U;
+      g_auto_load = 0U;
+      g_base_zero_set = 0U;
+      g_base_homing = 1U;
+      g_base_homed[0] = g_base_homed[1] = 0U;
+      g_base_home_confirm_ms[0] = g_base_home_confirm_ms[1] = 0U;
+      g_base_home_start_ms = now;
+      g_load_control_enabled = 0U;
+      g_load_command_waiting = 0U;
+      g_last_load_current[0] = g_last_load_current[1] = 0;
+      pid_reset(&g_load_velocity_pid[0]);
+      pid_reset(&g_load_velocity_pid[1]);
+      g_launcher_state = LAUNCHER_IDLE;
+      flags |= UART_CMD_ZERO_TRIGGER;
+    }
+  }
+  else if ((screen >= 0x10U) && (screen <= 0x13U))
+  {
+    /* 四档一一对应：索引 0~3 分别是按钮 10/11/12/13。
+     * trigger_positions 为 M2006 寻零后的累计计数，load_positions 为两台
+     * 3508 各自寻零后的累计计数；仅选档时 M2006 移动，3508 等待 01。
+     * 调整一档应同时核对两数组同一索引，不要误当角度/毫米。 */
+    static const int32_t trigger_positions[4] =
+        {36500000L, 24500000L, 12500000L, 500000L};
+    static const int32_t load_positions[4] =
+        {760000L, 920000L, 1020000L, 1060000L};
+    uint8_t selection = (uint8_t)(screen - 0x10U);
+    if (g_initialized && !g_initializing &&
+        ((g_launcher_state == LAUNCHER_IDLE) ||
+         (g_launcher_state == LAUNCHER_FAULT)) &&
+        motor_is_online(&g_trigger_feedback, now))
+    {
+      g_selected_load_target = load_positions[selection];
+      g_preset_selected = 1U;
+      trigger_target = trigger_positions[selection];
+      flags |= UART_CMD_SET_TRIGGER;
+    }
+    else
+    {
+      uart7_queue_response("POSITION NOT READY\r\n");
+    }
+  }
+  else if (screen == 0x01U)
+  {
+    /* 必须已初始化、选档且 M2006 位置稳定才允许装载；目标取选档缓存。 */
+    if (g_initialized && !g_initializing && g_base_zero_set &&
+        g_preset_selected && g_trigger_position_ready &&
+        motor_is_online(&g_load_feedback[0], now) &&
+        motor_is_online(&g_load_feedback[1], now))
+    {
+      load_target = g_selected_load_target;
+      flags |= UART_CMD_LOAD;
+      g_auto_load = 1U;
+    }
+    else
+    {
+      uart7_queue_response("LOAD NOT READY\r\n");
+    }
+  }
+  else if (screen == 0x03U)
+  {
+    /* 寻零过程中拒绝发射；FAULT 下的放行由下方 FIRE 状态分支决定。 */
+    if (!g_initializing)
+    {
+      flags |= UART_CMD_FIRE;
+    }
+    else
+    {
+      uart7_queue_response("FIRE NOT READY\r\n");
+    }
+  }
 
   if ((flags & UART_CMD_DEBUG_TOGGLE) != 0U)
   {
@@ -1053,6 +1048,10 @@ static void launcher_apply_commands(void)
     else
     {
       uart7_queue_response("CMD 7 NOT READY\r\n");
+      if (g_initializing)
+      {
+        abort_initialization("INIT FAILED\r\n");
+      }
     }
   }
 
@@ -1077,7 +1076,7 @@ static void launcher_apply_commands(void)
     {
       /* CMD 6 is intentionally ignored while CMD 7 is homing. */
     }
-    else if (g_trigger_zero_set &&
+    else if (g_initialized && g_trigger_zero_set &&
         ((g_launcher_state == LAUNCHER_IDLE) ||
          (g_launcher_state == LAUNCHER_FAULT)) &&
         motor_is_online(&g_trigger_feedback, now))
@@ -1104,7 +1103,8 @@ static void launcher_apply_commands(void)
 
   if ((flags & UART_CMD_LOAD) != 0U)
   {
-    if (g_trigger_position_ready &&
+    /* 装载先将舵机让位并启用两台 3508 位置环；自动装载按时间切换。 */
+    if (g_initialized && g_base_zero_set && g_trigger_position_ready &&
         ((g_launcher_state == LAUNCHER_IDLE) ||
          (g_launcher_state == LAUNCHER_LOADING) ||
          (g_launcher_state == LAUNCHER_LOCKING) ||
@@ -1144,6 +1144,7 @@ static void launcher_apply_commands(void)
     }
     else
     {
+      g_auto_load = 0U;
       uart7_queue_response("CMD 2 NOT READY\r\n");
     }
   }
@@ -1188,6 +1189,8 @@ static void launcher_apply_commands(void)
 
   if ((flags & UART_CMD_FIRE) != 0U)
   {
+    /* ARM/RETURN/FAULT 可发射：先切断 3508 输出，再等待舵机释放。
+     * FAULT 放行可能在初始化失败后发生，必须由现场操作规程保证安全。 */
     if ((g_launcher_state == LAUNCHER_ARMED) ||
         (g_launcher_state == LAUNCHER_RETURNING) ||
         (g_launcher_state == LAUNCHER_FAULT))
@@ -1210,15 +1213,26 @@ static void launcher_apply_commands(void)
 
 static void launcher_control_step(void)
 {
+  /* 每 1 ms 尝试执行一次非阻塞控制：检查反馈、更新寻零/状态机、
+   * 分别计算电流并通过 CAN 发出；计时依据 HAL_GetTick()。 */
   uint32_t now = HAL_GetTick();
   int16_t trigger_current = 0;
   int16_t trigger_homing_current = 0;
   int16_t yaw_current = 0;
   int16_t load0_current = 0;
   int16_t load1_current = 0;
+  uint8_t i;
   uint8_t yaw_stable;
   uint8_t load_stable;
   uint8_t trigger_stable;
+
+  if (g_initializing &&
+      (!motor_is_online(&g_trigger_feedback, now) ||
+       !motor_is_online(&g_load_feedback[0], now) ||
+       !motor_is_online(&g_load_feedback[1], now)))
+  {
+    abort_initialization("INIT FEEDBACK LOST\r\n");
+  }
 
   /* Once Yaw is close and slow, stop applying alternating corrections.  Yaw
    * has its own wider velocity deadband because the encoder velocity
@@ -1291,6 +1305,8 @@ static void launcher_control_step(void)
                                                            g_trigger_zero_offset));
   if (g_trigger_homing_enabled)
   {
+    /* M2006：速度 PID 输出达门槛并持续确认后，把当前累计角记为零点。
+     * 这里检测的是命令电流而非 feedback_current，勿与 3508 判据混淆。 */
     if (motor_is_online(&g_trigger_feedback, now))
     {
       trigger_homing_current = (int16_t)clamp_float(
@@ -1343,6 +1359,10 @@ static void launcher_control_step(void)
       trigger_current = 0;
       pid_reset(&g_trigger_velocity_pid);
       uart7_queue_response("CMD 7 TIMEOUT\r\n");
+      if (g_initializing)
+      {
+        abort_initialization("INIT TIMEOUT\r\n");
+      }
     }
   }
   else if (g_trigger_control_enabled && g_trigger_zero_set &&
@@ -1418,23 +1438,121 @@ static void launcher_control_step(void)
     g_launcher_state = LAUNCHER_RETURNING;
   }
 
-  if (g_load_control_enabled &&
+  if (g_auto_load && (g_launcher_state == LAUNCHER_LOADING) &&
+      (!motor_is_online(&g_load_feedback[0], now) ||
+       !motor_is_online(&g_load_feedback[1], now)))
+  {
+    g_auto_load = 0U;
+    g_load_control_enabled = 0U;
+    g_load_command_waiting = 0U;
+    g_last_load_current[0] = g_last_load_current[1] = 0;
+    g_launcher_state = LAUNCHER_FAULT;
+    uart7_queue_response("LOAD FEEDBACK LOST\r\n");
+  }
+  if (g_auto_load && (g_launcher_state == LAUNCHER_LOADING) &&
+      ((uint32_t)(now - g_load_motion_start_ms) >= LOAD_AUTO_LOCK_MS))
+  {
+    /* 3 秒后不检查是否到装载位置，直接锁舵机；等待 LOCK_WAIT 后回到
+     * LOAD_RETURN_POSITION。此时若机械未到位，也会执行切换。 */
+    g_auto_load = 0U;
+    g_return_target = LOAD_RETURN_POSITION;
+    g_load_command_waiting = 1U;
+    g_load_command_number = 3U;
+    g_load_stable_start_ms = 0U;
+    g_lock_start_ms = now;
+    g_launcher_state = LAUNCHER_LOCKING;
+    set_trigger_servo_angle(0U, SERVO_LOCK_0);
+    set_trigger_servo_angle(1U, SERVO_LOCK_1);
+  }
+
+  if (g_base_homing)
+  {
+    /* 两台 3508 共用起始时间，但分别记录确认时间和零点；先到位者电流归零。
+     * 收到的 CAN 电流须足够大、原始速度足够低且反馈距今不超过 20 ms。 */
+    int16_t home_current[2] = {0, 0};
+    if ((uint32_t)(now - g_base_home_start_ms) >= BASE_HOME_TIMEOUT_MS)
+    {
+      abort_initialization("INIT BASE TIMEOUT\r\n");
+    }
+    else
+    {
+      for (i = 0U; i < 2U; i++)
+      {
+        RM_MotorFeedback_t *motor = &g_load_feedback[i];
+        if (g_base_homed[i])
+        {
+          continue;
+        }
+        home_current[i] = (int16_t)clamp_float(
+            pid_update(&g_load_velocity_pid[i], BASE_HOME_VELOCITY,
+                       motor->filtered_velocity),
+            -(float)BASE_HOME_CURRENT_LIMIT,
+            (float)BASE_HOME_CURRENT_LIMIT);
+        if (i == 1U)
+        {
+          home_current[i] = (int16_t)-home_current[i];
+        }
+        if (((uint32_t)(now - g_base_home_start_ms) >= BASE_HOME_BLANK_MS) &&
+            ((uint32_t)(now - motor->last_update_ms) <= 20U) &&
+            (motor->feedback_current >= BASE_HOME_CURRENT_GATE ||
+             motor->feedback_current <= -BASE_HOME_CURRENT_GATE) &&
+            (motor->velocity <= BASE_HOME_SPEED_GATE) &&
+            (motor->velocity >= -BASE_HOME_SPEED_GATE))
+        {
+          if (g_base_home_confirm_ms[i] == 0U)
+          {
+            g_base_home_confirm_ms[i] = now;
+          }
+          else if ((uint32_t)(now - g_base_home_confirm_ms[i]) >=
+                   BASE_HOME_CONFIRM_MS)
+          {
+            g_base_homed[i] = 1U;
+            g_base_zero_offset[i] = motor->angle_with_rounds;
+            home_current[i] = 0;
+            pid_reset(&g_load_velocity_pid[i]);
+          }
+        }
+        else
+        {
+          g_base_home_confirm_ms[i] = 0U;
+        }
+      }
+      load0_current = home_current[0];
+      load1_current = home_current[1];
+      if (g_base_homed[0] && g_base_homed[1])
+      {
+        g_base_homing = 0U;
+        g_base_zero_set = 1U;
+      }
+    }
+  }
+
+  if (g_initializing && g_base_zero_set && g_trigger_zero_set)
+  {
+    /* 两台 3508 与 M2006 均完成寻零后才报告整体初始化成功。 */
+    g_initializing = 0U;
+    g_initialized = 1U;
+    uart7_queue_response("INIT DONE\r\n");
+  }
+
+  /* Homing current must not be overwritten by position or holding output. */
+  if (g_load_control_enabled && !g_base_homing &&
       motor_is_online(&g_load_feedback[0], now) &&
       motor_is_online(&g_load_feedback[1], now))
   {
     load0_current = position_controller(&g_load_feedback[0],
                                         &g_load_angle_pid[0],
                                         &g_load_velocity_pid[0],
-                                        g_load_target,
-                                        0,
+                                         g_load_target,
+                                         g_base_zero_offset[0],
                                         16384);
     /* Motor ID 3 is installed in the reverse direction, matching the source
      * project's angle_reverse=true configuration. */
     load1_current = (int16_t)-position_controller(&g_load_feedback[1],
                                                    &g_load_angle_pid[1],
                                                    &g_load_velocity_pid[1],
-                                                   g_load_target,
-                                                   0,
+                                                    g_load_target,
+                                                    g_base_zero_offset[1],
                                                    16384);
 
     /* During command 2 only, give each 3508 an independent, finite boost if
@@ -1456,7 +1574,7 @@ static void launcher_control_step(void)
     g_last_load_current[0] = load0_current;
     g_last_load_current[1] = load1_current;
   }
-  else if (g_load_control_enabled)
+  else if (g_load_control_enabled && !g_base_homing)
   {
     /* Keep the last M3508 command during a feedback gap; zero would release
      * the spring-loaded slide. */
@@ -1467,7 +1585,7 @@ static void launcher_control_step(void)
     pid_reset(&g_load_velocity_pid[0]);
     pid_reset(&g_load_velocity_pid[1]);
   }
-  else
+  else if (!g_base_homing)
   {
     g_last_load_current[0] = 0;
     g_last_load_current[1] = 0;
@@ -1477,13 +1595,13 @@ static void launcher_control_step(void)
                           motor_is_online(&g_load_feedback[1], now) &&
                           motor_at_target_and_stopped(&g_load_feedback[0],
                                                       g_load_target,
-                                                      LOAD_TARGET_TOLERANCE,
-                                                      0) &&
+                                                       LOAD_TARGET_TOLERANCE,
+                                                       g_base_zero_offset[0]) &&
                           motor_at_target_and_stopped(&g_load_feedback[1],
                                                       g_load_target,
-                                                      LOAD_TARGET_TOLERANCE,
-                                                      0));
-  if ((g_load_command_waiting != 0U) &&
+                                                       LOAD_TARGET_TOLERANCE,
+                                                       g_base_zero_offset[1]));
+  if ((g_load_command_waiting != 0U) && !g_auto_load &&
       ((g_launcher_state == LAUNCHER_LOADING) ||
        (g_launcher_state == LAUNCHER_RETURNING)))
   {
@@ -1570,6 +1688,8 @@ static void launcher_send_motor_currents(int16_t trigger_current,
                                          int16_t load1_current,
                                          int16_t yaw_current)
 {
+  /* CAN 0x200：依次 M2006(201)、3508(202)、反装 3508(203)；
+   * 0x1FE 的末两字节控制 Yaw(208)。邮箱满时本周期发送会跳过。 */
   CAN_TxHeaderTypeDef tx_header = {0};
   uint8_t data[8] = {0};
   uint32_t mailbox;
@@ -1768,15 +1888,25 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan)
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
+	/* 逐字节组帧：仅以 0D 0A 结束，超过缓冲区容量的帧丢至换行；
+	 * 回调末尾重新开启下一字节接收。输入必须发送二进制 00 而非字符 '0'。 */
 	if ((huart == NULL) || (huart->Instance != UART7))
 	{
 		return;
 	}
 
-	if (Uart7_Rx_Cnt >= (RXBUFFERSIZE - 1U))
+	if (g_uart7_discard_frame)
 	{
-		Uart7_Rx_Cnt = 0;
-		memset(RxBuffer, 0x00, sizeof(RxBuffer));
+		if (aRxBuffer == 0x0AU)
+		{
+			g_uart7_discard_frame = 0U;
+		}
+		Uart7_Rx_Cnt = 0U;
+	}
+	else if (Uart7_Rx_Cnt >= (RXBUFFERSIZE - 1U))
+	{
+		Uart7_Rx_Cnt = 0U;
+		g_uart7_discard_frame = (uint8_t)(aRxBuffer != 0x0AU);
 	}
 	else
 	{
